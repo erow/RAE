@@ -9,6 +9,7 @@ import logging
 import math
 import os
 from collections import defaultdict, OrderedDict
+from typing import Dict
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True

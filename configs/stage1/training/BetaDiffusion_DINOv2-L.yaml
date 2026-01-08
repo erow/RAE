@@ -1,0 +1,41 @@
+# β-Diffusion Training Configuration (Large)
+# Uses DINOv2-Large encoder with deeper DiT modulator
+
+# Data
+data_path: /path/to/imagenet
+image_size: 224
+batch_size: 32  # Reduced for larger model
+num_workers: 8
+
+# Model - Encoder
+encoder: dinov2-large
+
+# Model - Modulator (DiT)
+modulator_depth: 6
+modulator_heads: 16
+modulator_mlp_ratio: 4.0
+
+# Model - Decoder
+decoder_layers: 6
+decoder_hidden_dim: 1536
+decoder_patch_size: 16
+
+# β-Diffusion specific
+beta_min: 1.0
+beta_max: 100.0
+kl_weight: 1.0
+
+# Training
+epochs: 100
+lr: 5.0e-5  # Lower LR for larger model
+weight_decay: 0.05
+warmup_epochs: 10
+min_lr: 1.0e-6
+
+# Logging
+output_dir: ./output/beta_diffusion_large
+log_interval: 100
+save_interval: 5
+wandb: true
+wandb_project: beta-diffusion
+
