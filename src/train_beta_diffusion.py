@@ -145,13 +145,14 @@ def visualize_reconstructions(
     vis_path = os.path.join(save_path, f'recon_epoch{epoch:04d}.jpg')
     vutils.save_image(grid, vis_path)
     logger.info(f"Saved reconstruction visualization to {vis_path}")
-    
-    if use_wandb and wandb_utils.is_main_process():
-        wandb_utils.log({
-            'visualizations/recon_epoch': wandb_utils.wandb.Image(vis_path),
-            'epoch': epoch,
-        })
-
+    try:
+        if use_wandb and wandb_utils.is_main_process():
+            wandb_utils.log({
+                'visualizations/recon_epoch': wandb_utils.wandb.Image(vis_path),
+                'epoch': epoch,
+            })
+    except Exception as e:
+        logger.warning(f"Error logging to wandb: {e}")
 def evaluate_model(model: torch.nn.Module, val_loader: DataLoader, epoch: int,
                    vis_dir: str, logger: logging.Logger, beta_min: float, beta_max: float):
     model = model.module if isinstance(model, DDP) else model
@@ -441,7 +442,7 @@ def main():
             )
             if args.wandb:
                 wandb_utils.log(epoch_stats, step=global_step)
-        evaluate_model(ema_model, val_loader, epoch, vis_dir, logger, beta_min, beta_max)
+        evaluate_model(model, val_loader, epoch, vis_dir, logger, beta_min, beta_max)
     # save the final ckpt
     if rank == 0:
         logger.info(f"Saving final checkpoint at epoch {num_epochs}...")
