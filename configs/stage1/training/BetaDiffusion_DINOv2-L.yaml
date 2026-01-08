@@ -2,7 +2,6 @@
 # Uses DINOv2-Large encoder with deeper DiT modulator
 
 # Data
-data_path: /path/to/imagenet
 image_size: 224
 batch_size: 32  # Reduced for larger model
 num_workers: 8
@@ -36,6 +35,5 @@ min_lr: 1.0e-6
 output_dir: ./output/beta_diffusion_large
 log_interval: 100
 save_interval: 5
-wandb: true
 wandb_project: beta-diffusion
 

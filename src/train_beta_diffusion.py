@@ -46,7 +46,7 @@ def get_args():
     
     # Model
     parser.add_argument('--encoder', type=str, default='dinov2-base', 
-                        choices=['dinov2-base', 'dinov2-large'], help='Encoder backbone')
+                        choices=['dinov2-base', 'dinov2-large', 'mae-base', 'mae-large'], help='Encoder backbone')
     parser.add_argument('--modulator-depth', type=int, default=4, help='Number of DiT blocks in modulator')
     parser.add_argument('--decoder-layers', type=int, default=4, help='Number of MLP layers in decoder')
     parser.add_argument('--decoder-hidden-dim', type=int, default=1024, help='Decoder hidden dimension')
@@ -65,10 +65,10 @@ def get_args():
     parser.add_argument('--kl-weight', type=float, default=1.0, help='Additional KL weight multiplier')
     
     # Logging & Checkpointing
-    parser.add_argument('--output-dir', type=str, default='./output/beta_diffusion', help='Output directory')
+    parser.add_argument('--output-dir', type=str, default='./outputs/beta_diffusion', help='Output directory')
     parser.add_argument('--log-interval', type=int, default=100, help='Log every N steps')
     parser.add_argument('--save-interval', type=int, default=5, help='Save checkpoint every N epochs')
-    parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases logging')
+    parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases logging', default=False)
     parser.add_argument('--wandb-project', type=str, default='beta-diffusion', help='W&B project name')
     parser.add_argument('--exp-name', type=str, default=None, help='Experiment name')
     
@@ -88,8 +88,8 @@ def get_args():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
         for key, value in config.items():
-            if hasattr(args, key):
-                setattr(args, key, value)
+            # Set all config values, including nested dicts like 'model'
+            setattr(args, key, value)
     
     return args
 
@@ -198,6 +198,12 @@ def visualize_reconstructions(model, images, save_path, epoch, beta_values=[1, 1
     
     # Save
     vutils.save_image(grid, os.path.join(save_path, f'recon_epoch{epoch:04d}.png'))
+    if wandb.is_initialized():
+        wandb.log({
+            'visualizations/recon_epoch': 
+                wandb.Image(os.path.join(save_path, f'recon_epoch{epoch:04d}.png')),
+            'epoch': epoch,
+        })
     
     model.train()
 
@@ -278,6 +284,7 @@ def train_one_epoch(
 
 def main():
     args = get_args()
+    print(args)
     
     # Setup distributed training
     rank, world_size, distributed = setup_distributed()
@@ -285,9 +292,11 @@ def main():
     
     # Create output directory
     if args.exp_name is None:
-        args.exp_name = f'{args.encoder}_mod{args.modulator_depth}_dec{args.decoder_layers}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        model_args = args.model
+        args.exp_name = f'{model_args.encoder}_mod{model_args.modulator_depth}_dec{model_args.decoder_layers}'
     
-    output_dir = Path(args.output_dir) / args.exp_name
+    output_dir = Path(args.output_dir) / (args.exp_name + f'_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+    args.output_dir = str(output_dir)
     if rank == 0:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / 'checkpoints').mkdir(exist_ok=True)
@@ -309,26 +318,18 @@ def main():
     if rank == 0:
         print(f'Creating β-Diffusion model with {args.encoder} encoder...')
     
-    model = create_beta_diffusion(
-        encoder_name=args.encoder,
-        modulator_depth=args.modulator_depth,
-        decoder_layers=args.decoder_layers,
-        decoder_hidden_dim=args.decoder_hidden_dim,
-        decoder_patch_size=args.decoder_patch_size,
-        encoder_input_size=args.image_size,
-        beta_min=args.beta_min,
-        beta_max=args.beta_max,
-    ).to(device)
+    model_confg = args.model
+    model = create_beta_diffusion(**model_confg).to(device)
     
     # Count parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     if rank == 0:
         print(f'Trainable params: {trainable_params / 1e6:.2f}M / Total: {total_params / 1e6:.2f}M')
-    
+        print(model)
     # Distributed model
     if distributed:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     # Create dataloaders
     train_loader, train_sampler = create_dataloader(
@@ -399,9 +400,10 @@ def main():
             # Visualize reconstructions
             sample_batch = next(iter(val_loader))
             model_for_vis = model.module if distributed else model
+            beta_values = torch.linspace(args.beta_min, args.beta_max, 4).tolist()
             visualize_reconstructions(
                 model_for_vis, sample_batch[0], 
-                output_dir / 'visualizations', epoch
+                output_dir / 'visualizations', epoch, beta_values
             )
             
             # Save checkpoint

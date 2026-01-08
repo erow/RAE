@@ -28,6 +28,13 @@ L_{\text{ELBO}} = \|x - D_\psi(z, \beta)\|_2^2 + \beta \cdot \mathrm{KL}(q(z|x;\
 $$
 Here, $D_\psi$ is the MLP decoder, which also receives $\beta$ as an auxiliary input to adapt its reconstruction strategy to the enforced bottleneck intensity.
 
+## Experiments
+```bash
+python -m debugpy --listen 0.0.0.0:5679 -m torch.distributed.launch src/train_beta_diffusion.py \
+  --config configs/stage1/training/BetaDiffusion_DINOv2-B.yaml \
+  --data-path $IMNET 
+```
+
 
 ## Comparison
 

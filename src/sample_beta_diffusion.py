@@ -56,7 +56,8 @@ def sample_at_betas(model, image, beta_values, device):
         beta_tensor = torch.full((1,), beta, device=device)
         
         # Get latent distribution
-        mu, sigma = model.get_latent_distribution(h, beta_tensor)
+        mu, log_var = model.get_latent_distribution(h, beta_tensor)
+        std = torch.exp(0.5 * log_var)
         
         # Sample (deterministic - use mean)
         z = mu
@@ -69,8 +70,8 @@ def sample_at_betas(model, image, beta_values, device):
             'beta': beta,
             'mu_mean': mu.mean().item(),
             'mu_std': mu.std().item(),
-            'sigma_mean': sigma.mean().item(),
-            'sigma_std': sigma.std().item(),
+            'log_var_mean': log_var.mean().item(),
+            'std_mean': std.mean().item(),
         })
     
     return reconstructions, latent_stats
@@ -90,7 +91,7 @@ def main():
     
     # Create model
     model = create_beta_diffusion(
-        encoder_name=encoder_name,
+        encoder=encoder_name,
         modulator_depth=ckpt_args.get('modulator_depth', 4),
         decoder_layers=ckpt_args.get('decoder_layers', 4),
         decoder_hidden_dim=ckpt_args.get('decoder_hidden_dim', 1024),
@@ -109,12 +110,12 @@ def main():
     
     # Print latent statistics
     print('\nLatent Statistics:')
-    print('-' * 60)
-    print(f'{"β":>6} | {"μ mean":>10} | {"μ std":>10} | {"σ mean":>10} | {"σ std":>10}')
-    print('-' * 60)
+    print('-' * 70)
+    print(f'{"β":>6} | {"μ mean":>10} | {"μ std":>10} | {"log_var":>10} | {"std mean":>10}')
+    print('-' * 70)
     for stats in latent_stats:
         print(f'{stats["beta"]:>6.1f} | {stats["mu_mean"]:>10.4f} | {stats["mu_std"]:>10.4f} | '
-              f'{stats["sigma_mean"]:>10.4f} | {stats["sigma_std"]:>10.4f}')
+              f'{stats["log_var_mean"]:>10.4f} | {stats["std_mean"]:>10.4f}')
     
     # Save individual reconstructions
     for i, (recon, beta) in enumerate(zip(reconstructions, args.beta_values)):

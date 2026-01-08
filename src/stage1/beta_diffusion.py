@@ -224,8 +224,8 @@ class BetaDiffusionModulator(nn.Module):
     """
     VAE Modulator powered by Diffusion Transformer (DiT) blocks.
     
-    Takes encoder features h and β, outputs modulation scales s_μ(h;β) and s_σ(h;β)
-    that multiply the base μ and σ projections.
+    Takes encoder features h and β, outputs modulation scales s_μ(h;β) and s_log_var(h;β)
+    that multiply the base μ and log_var projections.
     """
     
     def __init__(
@@ -263,9 +263,9 @@ class BetaDiffusionModulator(nn.Module):
         self.norm = RMSNorm(hidden_size)
         
         # Output projections for modulation scales
-        # These produce multiplicative scales for μ and σ
+        # These produce multiplicative scales for μ and log_var
         self.scale_mu = nn.Linear(hidden_size, latent_dim)
-        self.scale_sigma = nn.Linear(hidden_size, latent_dim)
+        self.scale_log_var = nn.Linear(hidden_size, latent_dim)
         
         self._init_weights()
     
@@ -284,8 +284,8 @@ class BetaDiffusionModulator(nn.Module):
         # Initialize output projections to produce near-identity scaling initially
         nn.init.constant_(self.scale_mu.weight, 0)
         nn.init.constant_(self.scale_mu.bias, 1)  # s_μ starts at 1 (identity)
-        nn.init.constant_(self.scale_sigma.weight, 0)
-        nn.init.constant_(self.scale_sigma.bias, 1)  # s_σ starts at 1 (identity)
+        nn.init.constant_(self.scale_log_var.weight, 0)
+        nn.init.constant_(self.scale_log_var.bias, 1)  # s_log_var starts at 1 (identity)
     
     def forward(
         self, 
@@ -299,7 +299,7 @@ class BetaDiffusionModulator(nn.Module):
         
         Returns:
             s_mu: (B, N, latent_dim) multiplicative scale for μ
-            s_sigma: (B, N, latent_dim) multiplicative scale for σ  
+            s_log_var: (B, N, latent_dim) multiplicative scale for log_var  
         """
         # Project input if needed
         x = self.input_proj(h)
@@ -317,10 +317,10 @@ class BetaDiffusionModulator(nn.Module):
         
         # Final norm and project to scales
         x = self.norm(x)
-        s_mu = self.scale_mu(x)      # (B, N, latent_dim)
-        s_sigma = self.scale_sigma(x)  # (B, N, latent_dim)
+        s_mu = self.scale_mu(x)          # (B, N, latent_dim)
+        s_log_var = self.scale_log_var(x)  # (B, N, latent_dim)
         
-        return s_mu, s_sigma
+        return s_mu, s_log_var
 
 
 class BetaConditionedDecoder(nn.Module):
@@ -404,7 +404,9 @@ class BetaDiffusion(nn.Module):
     Architecture:
     - ViT Encoder (E): Extracts h = E(x)
     - VAE Modulator (M): DiT blocks that output β-dependent modulation
-    - Latent sampling: z ~ N(μ, σ²) where μ = f_μ(h) * s_μ(h;β), σ = f_σ(h) * s_σ(h;β)
+    - Latent sampling: z ~ N(μ, exp(log_var)) where:
+        μ = f_μ(h) * s_μ(h;β)
+        log_var = f_log_var(h) * s_log_var(h;β)
     - Decoder (D_ψ): Reconstructs x from z with β conditioning
     
     Training: β ~ U(1, 100)
@@ -417,13 +419,14 @@ class BetaDiffusion(nn.Module):
         encoder_cls: str = 'Dinov2withNorm',
         encoder_config_path: str = 'facebook/dinov2-base',
         encoder_input_size: int = 224,
+        encoder_freeze: bool = True,
         encoder_params: dict = {},
         # Modulator configs
         modulator_depth: int = 4,
         modulator_heads: int = 8,
         modulator_mlp_ratio: float = 4.0,
         # Latent configs
-        latent_dim: int = 768,
+        latent_dim: int = 64,
         # Decoder configs
         decoder_hidden_dim: int = 1024,
         decoder_num_layers: int = 4,
@@ -446,7 +449,7 @@ class BetaDiffusion(nn.Module):
         # Initialize encoder
         encoder_cls_obj = ARCHS[encoder_cls]
         self.encoder = encoder_cls_obj(**encoder_params)
-        self.encoder.requires_grad_(False)  # Freeze encoder
+        self.encoder.requires_grad_(not encoder_freeze)  # Freeze encoder
         
         # Load encoder normalization
         proc = AutoImageProcessor.from_pretrained(encoder_config_path)
@@ -460,9 +463,9 @@ class BetaDiffusion(nn.Module):
         # Calculate number of patches
         self.num_patches = (encoder_input_size // self.encoder_patch_size) ** 2
         
-        # Base latent projections: f_μ and f_σ
+        # Base latent projections: f_μ and f_log_var
         self.f_mu = nn.Linear(encoder_hidden_size, latent_dim)
-        self.f_sigma = nn.Linear(encoder_hidden_size, latent_dim)
+        self.f_log_var = nn.Linear(encoder_hidden_size, latent_dim)
         
         # VAE Modulator (DiT)
         self.modulator = BetaDiffusionModulator(
@@ -498,11 +501,11 @@ class BetaDiffusion(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        # Initialize f_μ and f_σ
+        # Initialize f_μ and f_log_var
         nn.init.xavier_uniform_(self.f_mu.weight)
         nn.init.zeros_(self.f_mu.bias)
-        nn.init.xavier_uniform_(self.f_sigma.weight)
-        nn.init.zeros_(self.f_sigma.bias)
+        nn.init.xavier_uniform_(self.f_log_var.weight)
+        nn.init.zeros_(self.f_log_var.bias)
     
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features using frozen encoder."""
@@ -526,31 +529,31 @@ class BetaDiffusion(nn.Module):
         Compute latent distribution parameters modulated by β.
         
         μ = f_μ(h) * s_μ(h; β)
-        σ = softplus(f_σ(h) * s_σ(h; β))
+        log_var = f_log_var(h) * s_log_var(h; β)
         """
         # Base projections
-        base_mu = self.f_mu(h)      # (B, N, latent_dim)
-        base_sigma = self.f_sigma(h)  # (B, N, latent_dim)
+        base_mu = self.f_mu(h)            # (B, N, latent_dim)
+        base_log_var = self.f_log_var(h)  # (B, N, latent_dim)
         
         # Get β-conditioned modulation scales
-        s_mu, s_sigma = self.modulator(h, beta)  # (B, N, latent_dim)
+        s_mu, s_log_var = self.modulator(h, beta)  # (B, N, latent_dim)
         
         # Apply modulation
         mu = base_mu * s_mu
-        # Use softplus to ensure positive σ
-        sigma = F.softplus(base_sigma * s_sigma) + self.eps
+        log_var = base_log_var * s_log_var
         
-        return mu, sigma
+        return mu, log_var
     
     def reparameterize(
         self, 
         mu: torch.Tensor, 
-        sigma: torch.Tensor
+        log_var: torch.Tensor
     ) -> torch.Tensor:
-        """Sample z using reparameterization trick: z = μ + σ * ε"""
+        """Sample z using reparameterization trick: z = μ + std * ε where std = exp(0.5 * log_var)"""
         if self.training:
+            std = torch.exp(0.5 * log_var)
             eps = torch.randn_like(mu)
-            z = mu + sigma * eps
+            z = mu + std * eps
         else:
             z = mu
         return z
@@ -594,16 +597,16 @@ class BetaDiffusion(nn.Module):
     def compute_kl_divergence(
         self, 
         mu: torch.Tensor, 
-        sigma: torch.Tensor
+        log_var: torch.Tensor
     ) -> torch.Tensor:
         """
         Compute KL divergence: KL(q(z|x;β) || p(z))
         where p(z) = N(0, I)
         
-        KL = 0.5 * (σ² + μ² - 1 - log(σ²))
+        KL = 0.5 * (exp(log_var) + μ² - 1 - log_var)
         """
-        kl = 0.5 * (sigma.pow(2) + mu.pow(2) - 1 - torch.log(sigma.pow(2) + self.eps))
-        return kl.sum(dim=-1).mean()  # Sum over latent dim, mean over batch and patches
+        kl = 0.5 * (torch.exp(log_var) + mu.pow(2) - 1 - log_var)
+        return kl.sum(dim=-1)
     
     def forward(
         self, 
@@ -621,7 +624,7 @@ class BetaDiffusion(nn.Module):
             Dict containing:
                 - x_rec: reconstructed images
                 - mu: latent means
-                - sigma: latent stds
+                - log_var: latent log variances
                 - z: sampled latents
                 - beta: noise scales used
                 - loss: total ELBO loss
@@ -637,36 +640,38 @@ class BetaDiffusion(nn.Module):
         
         # Encode
         h = self.encode(x)  # (B, N, D)
+        B, N, D = h.shape
         
         # Get modulated latent distribution
-        mu, sigma = self.get_latent_distribution(h, beta)
+        mu, log_var = self.get_latent_distribution(h, beta)
         
         # Sample z
-        z = self.reparameterize(mu, sigma)
+        z = self.reparameterize(mu, log_var)
         
         # Decode
         x_rec = self.decode(z, beta)
         
         # Compute losses
         # Reconstruction loss
-        recon_loss = F.mse_loss(x_rec, x, reduction='none').sum(dim=(1, 2, 3)).mean()
+        recon_loss = F.mse_loss(x_rec, x, reduction='none').sum(dim=(1, 2, 3)) / N
         
         # KL divergence (β-weighted)
-        kl_loss = self.compute_kl_divergence(mu, sigma)
+        kl_loss = self.compute_kl_divergence(mu, log_var)
         
         # Total ELBO loss with β weighting on KL
         # L_ELBO = ||x - D_ψ(z, β)||² + β · KL(q(z|x;β) || p(z))
-        loss = recon_loss + beta.mean() * kl_loss
+        loss = recon_loss + beta * kl_loss.mean(1)
+        loss = loss.mean()
         
         return {
             'x_rec': x_rec,
             'mu': mu,
-            'sigma': sigma,
+            'log_var': log_var,
             'z': z,
             'beta': beta,
             'loss': loss,
-            'recon_loss': recon_loss,
-            'kl_loss': kl_loss,
+            'recon_loss': recon_loss.mean(),
+            'kl_loss': kl_loss.mean(),
         }
     
     @torch.no_grad()
@@ -686,7 +691,7 @@ class BetaDiffusion(nn.Module):
         beta_tensor = torch.full((B,), beta, device=device)
         
         h = self.encode(x)
-        mu, sigma = self.get_latent_distribution(h, beta_tensor)
+        mu, log_var = self.get_latent_distribution(h, beta_tensor)
         z = mu  # Use mean for deterministic sampling
         x_rec = self.decode(z, beta_tensor)
         
@@ -710,7 +715,7 @@ class BetaDiffusion(nn.Module):
         
         for beta in beta_values:
             beta_tensor = torch.full((B,), beta, device=device)
-            mu, sigma = self.get_latent_distribution(h, beta_tensor)
+            mu, log_var = self.get_latent_distribution(h, beta_tensor)
             z = mu
             x_rec = self.decode(z, beta_tensor)
             results.append(x_rec)
@@ -720,7 +725,7 @@ class BetaDiffusion(nn.Module):
 
 # Factory function for creating models
 def create_beta_diffusion(
-    encoder_name: str = 'dinov2-base',
+    encoder: str = 'dinov2-base',
     modulator_depth: int = 4,
     decoder_layers: int = 4,
     **kwargs
@@ -732,22 +737,30 @@ def create_beta_diffusion(
             'encoder_cls': 'Dinov2withNorm',
             'encoder_config_path': 'facebook/dinov2-base',
             'encoder_params': {'dinov2_path': 'facebook/dinov2-with-registers-base'},
-            'latent_dim': 768,
+            
             'modulator_heads': 12,
         },
         'dinov2-large': {
             'encoder_cls': 'Dinov2withNorm', 
             'encoder_config_path': 'facebook/dinov2-large',
             'encoder_params': {'dinov2_path': 'facebook/dinov2-with-registers-large'},
-            'latent_dim': 1024,
-            'modulator_heads': 16,
+        },
+        'mae-base': {
+            'encoder_cls': 'MAEwNorm',
+            'encoder_config_path': 'facebook/vit-mae-base',
+            'encoder_params': {'model_name': 'facebook/vit-mae-base'},
+        },
+        'mae-large': {
+            'encoder_cls': 'MAEwNorm',
+            'encoder_config_path': 'facebook/vit-mae-large',
+            'encoder_params': {'model_name': 'facebook/vit-mae-large'},
         },
     }
     
-    if encoder_name not in config_map:
-        raise ValueError(f"Unknown encoder: {encoder_name}. Available: {list(config_map.keys())}")
+    if encoder not in config_map:
+        raise ValueError(f"Unknown encoder: {encoder}. Available: {list(config_map.keys())}")
     
-    config = config_map[encoder_name]
+    config = config_map[encoder]
     config['modulator_depth'] = modulator_depth
     config['decoder_num_layers'] = decoder_layers
     config.update(kwargs)
