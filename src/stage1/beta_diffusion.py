@@ -317,15 +317,95 @@ class BetaDiffusionModulator(nn.Module):
         
         # Final norm and project to scales
         x = self.norm(x)
-        s_mu = self.scale_mu(x)          # (B, N, latent_dim)
-        s_log_var = self.scale_log_var(x)  # (B, N, latent_dim)
+        s_mu = self.scale_mu(x).sigmoid()          # (B, N, latent_dim)
+        s_log_var = self.scale_log_var(x).sigmoid()  # (B, N, latent_dim)
         
         return s_mu, s_log_var
 
 
+class DecoderMLPBlock(nn.Module):
+    """MLP block with AdaLN-Zero β conditioning."""
+    
+    def __init__(self, hidden_dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.norm = RMSNorm(hidden_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden, hidden_dim),
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * hidden_dim)
+        )
+        # Zero init for stable training
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+    
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, D) input features
+            c: (B, D) conditioning (β embedding)
+        """
+        scale, gate = self.adaLN_modulation(c).chunk(2, dim=-1)
+        x = x + gate.unsqueeze(1) * self.mlp(self.norm(x) * (1 + scale.unsqueeze(1)))
+        return x
+
+
+class DecoderAttentionBlock(nn.Module):
+    """Attention block with AdaLN-Zero β conditioning."""
+    
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_dim)
+        self.norm2 = RMSNorm(hidden_dim)
+        
+        self.attn = ModulatorAttention(
+            hidden_dim,
+            num_heads=num_heads,
+            qkv_bias=True,
+            qk_norm=True,
+        )
+        
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.mlp = SwiGLUFFN(hidden_dim, int(2/3 * mlp_hidden))
+        
+        # AdaLN modulation: scale and gate for attention and MLP
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 4 * hidden_dim, bias=True)
+        )
+        # Zero init for stable training
+        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
+    
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, D) input features
+            c: (B, D) conditioning (β embedding)
+        """
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(4, dim=-1)
+        
+        # Self-attention with modulation
+        x = x + gate_msa.unsqueeze(1) * self.attn(self.norm1(x) * (1 + scale_msa.unsqueeze(1)))
+        # MLP with modulation
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(self.norm2(x) * (1 + scale_mlp.unsqueeze(1)))
+        
+        return x
+
+
 class BetaConditionedDecoder(nn.Module):
     """
-    MLP decoder that receives z and β as inputs.
+    Decoder that receives z and β as inputs.
+    Supports either MLP blocks or Attention blocks.
     Adapts reconstruction strategy based on the enforced bottleneck intensity.
     """
     
@@ -336,32 +416,47 @@ class BetaConditionedDecoder(nn.Module):
         output_dim: int,  # patch_size^2 * 3
         num_patches: int,
         num_layers: int = 4,
+        block_type: str = 'mlp',  # 'mlp' or 'attention'
+        num_heads: int = 8,
+        mlp_ratio: float = 4.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.num_patches = num_patches
         self.output_dim = output_dim
+        self.block_type = block_type
         
         # β embedding for decoder
         self.beta_embedder = GaussianFourierEmbedding(hidden_dim)
         
-        # Combine z and β
+        # Input projection
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
         
-        # MLP layers with β modulation
-        layers = []
-        for i in range(num_layers):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.SiLU())
-        self.mlp = nn.Sequential(*layers)
+        # Positional embedding (for attention blocks)
+        if block_type == 'attention':
+            self.pos_embed = nn.Parameter(
+                torch.zeros(1, num_patches, hidden_dim), requires_grad=False
+            )
+            pos_embed = get_2d_sincos_pos_embed(hidden_dim, int(num_patches ** 0.5))
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        else:
+            self.pos_embed = None
         
-        # AdaLN modulation for β conditioning
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2 * hidden_dim)
-        )
+        # Build decoder blocks
+        if block_type == 'mlp':
+            self.blocks = nn.ModuleList([
+                DecoderMLPBlock(hidden_dim, mlp_ratio=mlp_ratio)
+                for _ in range(num_layers)
+            ])
+        elif block_type == 'attention':
+            self.blocks = nn.ModuleList([
+                DecoderAttentionBlock(hidden_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+                for _ in range(num_layers)
+            ])
+        else:
+            raise ValueError(f"Unknown block_type: {block_type}. Choose 'mlp' or 'attention'.")
         
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm = RMSNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, output_dim)
     
     def forward(self, z: torch.Tensor, beta: torch.Tensor) -> torch.Tensor:
@@ -384,14 +479,16 @@ class BetaConditionedDecoder(nn.Module):
         # Project latent
         x = self.input_proj(z)  # (B, N, hidden_dim)
         
-        # Apply MLP
-        x = self.mlp(x)
+        # Add positional embedding for attention blocks
+        if self.pos_embed is not None and x.shape[1] == self.num_patches:
+            x = x + self.pos_embed
         
-        # Apply β-conditioned modulation
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = self.norm(x) * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        # Apply blocks
+        for block in self.blocks:
+            x = block(x, c)
         
-        # Output projection
+        # Final norm and output projection
+        x = self.norm(x)
         out = self.output_proj(x)  # (B, N, output_dim)
         
         return out
@@ -431,6 +528,9 @@ class BetaDiffusion(nn.Module):
         decoder_hidden_dim: int = 1024,
         decoder_num_layers: int = 4,
         decoder_patch_size: int = 16,
+        decoder_block_type: str = 'mlp',  # 'mlp' or 'attention'
+        decoder_num_heads: int = 8,
+        decoder_mlp_ratio: float = 4.0,
         # Training configs
         beta_min: float = 1.0,
         beta_max: float = 100.0,
@@ -485,6 +585,9 @@ class BetaDiffusion(nn.Module):
             output_dim=output_dim,
             num_patches=self.num_patches,
             num_layers=decoder_num_layers,
+            block_type=decoder_block_type,
+            num_heads=decoder_num_heads,
+            mlp_ratio=decoder_mlp_ratio,
         )
         
         self.decoder_patch_size = decoder_patch_size

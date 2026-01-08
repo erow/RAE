@@ -86,13 +86,13 @@ def initialize(args, entity, exp_name, project_name):
 
 
 def log(stats, step=None):
-    if is_main_process():
+    if is_main_process() and wandb.run:
         # print(f"WandB logging at step {step}: {stats}")
         wandb.log({k: v for k, v in stats.items()}, step=step)
 
 
 def log_image(sample, step=None):
-    if is_main_process():
+    if is_main_process() and wandb.run:
         sample = array2grid(sample)
         wandb.log({f"samples": wandb.Image(sample)}, step=step)
 

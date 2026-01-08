@@ -4,6 +4,7 @@ from PIL import Image
 import numpy as np
 from collections import OrderedDict
 import torch
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms

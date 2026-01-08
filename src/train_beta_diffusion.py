@@ -4,177 +4,122 @@ Training script for β-Diffusion.
 β-Diffusion learns high-level visual representations through a noise-conditioned 
 VAE architecture with DiT-based modulation.
 """
-
-import os
-import sys
 import argparse
-import yaml
+import logging
 import math
-import wandb
-from pathlib import Path
-from datetime import datetime
+import os
+from collections import defaultdict, OrderedDict
+from typing import Dict, Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-
-import torchvision.transforms as T
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
+from torchvision import transforms
+import numpy as np
+from PIL import Image
+from copy import deepcopy
+from glob import glob
+from time import time
+from pathlib import Path
+from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
+from omegaconf import OmegaConf, DictConfig
 
-try:
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.utils.data.distributed import DistributedSampler
-    HAS_DISTRIBUTED = True
-except ImportError:
-    HAS_DISTRIBUTED = False
-
+##### model imports
 from stage1.beta_diffusion import BetaDiffusion, create_beta_diffusion
 
+##### general utils
+from utils import wandb_utils
+from utils.model_utils import instantiate_from_config
+from utils.train_utils import (
+    center_crop_arr,
+    update_ema,
+    prepare_dataloader,
+    get_autocast_scaler,
+)
+from utils.optim_utils import build_optimizer, build_scheduler
+from utils.resume_utils import configure_experiment_dirs, find_resume_checkpoint, save_worktree
+from utils.wandb_utils import create_logger
+from utils.dist_utils import setup_distributed, cleanup_distributed
 
-def get_args():
-    parser = argparse.ArgumentParser(description='Train β-Diffusion')
+
+def parse_beta_diffusion_configs(config: DictConfig) -> Tuple[DictConfig, DictConfig, DictConfig]:
+    """Load a config file and return component sections as DictConfigs."""
+    model_config = config.get("model", None)
+    training_config = config.get("training", None)
+    data_config = config.get("data", None)
+    return model_config, training_config, data_config
+
+
+def save_checkpoint(
+    path: str,
+    step: int,
+    epoch: int,
+    model: DDP,
+    ema_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[LambdaLR],
+) -> None:
+    state = {
+        "step": step,
+        "epoch": epoch,
+        "model": model.module.state_dict(),
+        "ema": ema_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+    }
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(state, path)
+
+
+def load_checkpoint(
+    path: str,
+    model: DDP,
+    ema_model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[LambdaLR],
+) -> Tuple[int, int]:
+    checkpoint = torch.load(path, map_location="cpu")
+    model.module.load_state_dict(checkpoint["model"])
+    ema_model.load_state_dict(checkpoint["ema"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    if scheduler is not None and checkpoint.get("scheduler") is not None:
+        scheduler.load_state_dict(checkpoint["scheduler"])
+    return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train β-Diffusion model.")
+    parser.add_argument("--config", type=str, required=True, help="YAML config file.")
+    parser.add_argument("--data-path", type=Path, required=True, help="Directory with ImageFolder structure for training.")
+    parser.add_argument("--results-dir", type=str, default="ckpts", help="Directory to store training outputs.")
+    parser.add_argument("--image-size", type=int, default=256, help="Input image resolution.")
+    parser.add_argument("--precision", type=str, choices=["fp32", "fp16", "bf16"], default="fp32", help="Compute precision for training.")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.", default=False)
+    parser.add_argument("--compile", action="store_true", help="Use torch compile.", default=False)
+    parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
+    parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")
     
-    # Data
-    parser.add_argument('--data-path', type=str, required=True, help='Path to ImageNet or similar dataset')
-    parser.add_argument('--image-size', type=int, default=224, help='Input image size')
-    parser.add_argument('--batch-size', type=int, default=64, help='Batch size per GPU')
-    parser.add_argument('--num-workers', type=int, default=8, help='DataLoader workers')
-    
-    # Model
-    parser.add_argument('--encoder', type=str, default='dinov2-base', 
-                        choices=['dinov2-base', 'dinov2-large', 'mae-base', 'mae-large'], help='Encoder backbone')
-    parser.add_argument('--modulator-depth', type=int, default=4, help='Number of DiT blocks in modulator')
-    parser.add_argument('--decoder-layers', type=int, default=4, help='Number of MLP layers in decoder')
-    parser.add_argument('--decoder-hidden-dim', type=int, default=1024, help='Decoder hidden dimension')
-    parser.add_argument('--decoder-patch-size', type=int, default=16, help='Decoder patch size')
-    
-    # Training
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--weight-decay', type=float, default=0.05, help='Weight decay')
-    parser.add_argument('--warmup-epochs', type=int, default=5, help='Warmup epochs')
-    parser.add_argument('--min-lr', type=float, default=1e-6, help='Minimum learning rate')
-    
-    # β-Diffusion specific
-    parser.add_argument('--beta-min', type=float, default=1.0, help='Minimum β value')
-    parser.add_argument('--beta-max', type=float, default=100.0, help='Maximum β value')
-    parser.add_argument('--kl-weight', type=float, default=1.0, help='Additional KL weight multiplier')
-    
-    # Logging & Checkpointing
-    parser.add_argument('--output-dir', type=str, default='./outputs/beta_diffusion', help='Output directory')
-    parser.add_argument('--log-interval', type=int, default=100, help='Log every N steps')
-    parser.add_argument('--save-interval', type=int, default=5, help='Save checkpoint every N epochs')
-    parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases logging', default=False)
-    parser.add_argument('--wandb-project', type=str, default='beta-diffusion', help='W&B project name')
-    parser.add_argument('--exp-name', type=str, default=None, help='Experiment name')
-    
-    # Resume
-    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
-    
-    # Distributed
-    parser.add_argument('--local-rank', type=int, default=0)
-    
-    # Config file (overrides command line args)
-    parser.add_argument('--config', type=str, default=None, help='Path to YAML config file')
-    
+    parser.add_argument("--local-rank", type=int, default=0, help="Local rank for distributed training.")
     args = parser.parse_args()
-    
-    # Load config file if provided
-    if args.config is not None:
-        with open(args.config, 'r') as f:
-            config = yaml.safe_load(f)
-        for key, value in config.items():
-            # Set all config values, including nested dicts like 'model'
-            setattr(args, key, value)
-    
     return args
 
 
-def setup_distributed():
-    """Initialize distributed training."""
-    if not HAS_DISTRIBUTED:
-        return 0, 1, False
-    
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')
-        
-        return rank, world_size, True
-    else:
-        return 0, 1, False
-
-
-def get_transforms(image_size: int, is_train: bool = True):
-    """Get data transforms."""
-    if is_train:
-        return T.Compose([
-            T.RandomResizedCrop(image_size, scale=(0.8, 1.0), interpolation=T.InterpolationMode.BICUBIC),
-            T.RandomHorizontalFlip(),
-            T.ToTensor(),
-        ])
-    else:
-        return T.Compose([
-            T.Resize(image_size, interpolation=T.InterpolationMode.BICUBIC),
-            T.CenterCrop(image_size),
-            T.ToTensor(),
-        ])
-
-
-def create_dataloader(args, is_train: bool = True, distributed: bool = False, rank: int = 0, world_size: int = 1):
-    """Create training/validation dataloader."""
-    transform = get_transforms(args.image_size, is_train)
-    
-    split = 'train' if is_train else 'val'
-    data_path = os.path.join(args.data_path, split)
-    
-    if not os.path.exists(data_path):
-        # Try without split subdirectory
-        data_path = args.data_path
-    
-    dataset = ImageFolder(data_path, transform=transform)
-    
-    sampler = None
-    if distributed and is_train:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
-    
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=(sampler is None and is_train),
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=is_train,
-    )
-    
-    return loader, sampler
-
-
-def get_lr_scheduler(optimizer, args, steps_per_epoch: int):
-    """Create learning rate scheduler with warmup."""
-    total_steps = args.epochs * steps_per_epoch
-    warmup_steps = args.warmup_epochs * steps_per_epoch
-    
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps
-        else:
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return args.min_lr / args.lr + (1 - args.min_lr / args.lr) * 0.5 * (1 + math.cos(math.pi * progress))
-    
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-
 @torch.no_grad()
-def visualize_reconstructions(model, images, save_path, epoch, beta_values=[1, 10, 50, 100]):
+def visualize_reconstructions(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    save_path: str,
+    epoch: int,
+    beta_values: list,
+    logger: logging.Logger,
+    use_wandb: bool = True,
+):
     """Save visualization of reconstructions at different β values."""
     import torchvision.utils as vutils
     
@@ -197,252 +142,324 @@ def visualize_reconstructions(model, images, save_path, epoch, beta_values=[1, 1
     grid = vutils.make_grid(grid.clamp(0, 1), nrow=B, padding=2)
     
     # Save
-    vutils.save_image(grid, os.path.join(save_path, f'recon_epoch{epoch:04d}.png'))
-    if wandb.is_initialized():
-        wandb.log({
-            'visualizations/recon_epoch': 
-                wandb.Image(os.path.join(save_path, f'recon_epoch{epoch:04d}.png')),
+    vis_path = os.path.join(save_path, f'recon_epoch{epoch:04d}.jpg')
+    vutils.save_image(grid, vis_path)
+    logger.info(f"Saved reconstruction visualization to {vis_path}")
+    
+    if use_wandb and wandb_utils.is_main_process():
+        wandb_utils.log({
+            'visualizations/recon_epoch': wandb_utils.wandb.Image(vis_path),
             'epoch': epoch,
         })
+
+def evaluate_model(model: torch.nn.Module, val_loader: DataLoader, epoch: int,
+                   vis_dir: str, logger: logging.Logger, beta_min: float, beta_max: float):
+    model = model.module if isinstance(model, DDP) else model
+    model.eval()
     
+    logger.info("Generating EMA reconstructions...")
+    sample_batch = next(iter(val_loader))
+    beta_values = torch.linspace(beta_min, beta_max, 4).tolist()
+    visualize_reconstructions(
+        model, sample_batch[0], vis_dir, epoch, beta_values, logger, use_wandb=True
+    )
     model.train()
-
-
-def train_one_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler,
-    epoch: int,
-    args,
-    rank: int = 0,
-    global_step: int = 0,
-):
-    """Train for one epoch."""
-    model.train()
-    device = next(model.parameters()).device
     
-    total_loss = 0.0
-    total_recon_loss = 0.0
-    total_kl_loss = 0.0
-    
-    for batch_idx, (images, _) in enumerate(dataloader):
-        images = images.to(device, non_blocking=True)
-        
-        # Forward pass
-        outputs = model(images)
-        
-        # Apply additional KL weight if specified
-        loss = outputs['recon_loss'] + args.kl_weight * outputs['beta'].mean() * outputs['kl_loss']
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        scheduler.step()
-        
-        # Accumulate losses
-        total_loss += loss.item()
-        total_recon_loss += outputs['recon_loss'].item()
-        total_kl_loss += outputs['kl_loss'].item()
-        
-        global_step += 1
-        
-        # Logging
-        if batch_idx % args.log_interval == 0 and rank == 0:
-            lr = scheduler.get_last_lr()[0]
-            avg_beta = outputs['beta'].mean().item()
-            
-            print(f'Epoch [{epoch}][{batch_idx}/{len(dataloader)}] '
-                  f'Loss: {loss.item():.4f} '
-                  f'Recon: {outputs["recon_loss"].item():.4f} '
-                  f'KL: {outputs["kl_loss"].item():.4f} '
-                  f'β: {avg_beta:.2f} '
-                  f'LR: {lr:.6f}')
-            
-            if args.wandb:
-                wandb.log({
-                    'train/loss': loss.item(),
-                    'train/recon_loss': outputs['recon_loss'].item(),
-                    'train/kl_loss': outputs['kl_loss'].item(),
-                    'train/beta_mean': avg_beta,
-                    'train/lr': lr,
-                    'step': global_step,
-                })
-    
-    n_batches = len(dataloader)
-    return {
-        'loss': total_loss / n_batches,
-        'recon_loss': total_recon_loss / n_batches,
-        'kl_loss': total_kl_loss / n_batches,
-    }, global_step
-
-
 def main():
-    args = get_args()
-    print(args)
+    """Train β-Diffusion model using config-driven hyperparameters."""
+    args = parse_args()
+    if not torch.cuda.is_available():
+        raise RuntimeError("Training currently requires at least one GPU.")
     
-    # Setup distributed training
-    rank, world_size, distributed = setup_distributed()
-    device = torch.device(f'cuda:{rank}' if torch.cuda.is_available() else 'cpu')
+    rank, world_size, device = setup_distributed()
+    full_cfg = OmegaConf.load(args.config)
+    model_config, training_config, data_config = parse_beta_diffusion_configs(full_cfg)
     
-    # Create output directory
-    if args.exp_name is None:
-        model_args = args.model
-        args.exp_name = f'{model_args.encoder}_mod{model_args.modulator_depth}_dec{model_args.decoder_layers}'
+    def to_dict(cfg_section):
+        if cfg_section is None:
+            return {}
+        return OmegaConf.to_container(cfg_section, resolve=True)
     
-    output_dir = Path(args.output_dir) / (args.exp_name + f'_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-    args.output_dir = str(output_dir)
+    model_cfg = to_dict(model_config)
+    training_cfg = to_dict(training_config)
+    data_cfg = to_dict(data_config)
+    
+    # Data config
+    image_size = int(data_cfg.get("image_size", args.image_size))
+    num_workers = int(data_cfg.get("num_workers", 4))
+    
+    # Training config
+    grad_accum_steps = int(training_cfg.get("grad_accum_steps", 1))
+    if grad_accum_steps < 1:
+        raise ValueError("Gradient accumulation steps must be >= 1.")
+    clip_grad_val = training_cfg.get("clip_grad", 1.0)
+    clip_grad = float(clip_grad_val) if clip_grad_val is not None else None
+    if clip_grad is not None and clip_grad <= 0:
+        clip_grad = None
+    ema_decay = float(training_cfg.get("ema_decay", 0.9999))
+    num_epochs = int(training_cfg.get("epochs", 100))
+    
+    global_batch_size = training_cfg.get("global_batch_size", None)
+    if global_batch_size is not None:
+        global_batch_size = int(global_batch_size)
+        assert global_batch_size % world_size == 0, "global_batch_size must be divisible by world_size"
+    else:
+        batch_size = int(training_cfg.get("batch_size", 64))
+        global_batch_size = batch_size * world_size * grad_accum_steps
+    
+    log_interval = int(training_cfg.get("log_interval", 100))
+    sample_every = int(training_cfg.get("sample_every", 500))
+    checkpoint_interval = int(training_cfg.get("checkpoint_interval", 5))  # epoch based
+    default_seed = int(training_cfg.get("global_seed", 0))
+    
+    # β-Diffusion specific
+    beta_min = float(model_cfg.get("beta_min", 1.0))
+    beta_max = float(model_cfg.get("beta_max", 100.0))
+    
+    global_seed = args.global_seed if args.global_seed is not None else default_seed
+    seed = global_seed * world_size + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    micro_batch_size = global_batch_size // (world_size * grad_accum_steps)
+    
+    ### AMP init
+    scaler, autocast_kwargs = get_autocast_scaler(args)
+    
+    experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(args, rank)
+    vis_dir = os.path.join(experiment_dir, "visualizations")
     if rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / 'checkpoints').mkdir(exist_ok=True)
-        (output_dir / 'visualizations').mkdir(exist_ok=True)
-        
-        # Save config
-        with open(output_dir / 'config.yaml', 'w') as f:
-            yaml.dump(vars(args), f)
+        os.makedirs(vis_dir, exist_ok=True)
     
-    # Initialize wandb
-    if args.wandb and rank == 0:
-        wandb.init(
-            project=args.wandb_project,
-            name=args.exp_name,
-            config=vars(args),
-        )
+    #### Model init
+    logger.info(f"Creating β-Diffusion model...")
+    model: BetaDiffusion = create_beta_diffusion(**model_cfg).to(device)
     
-    # Create model
-    if rank == 0:
-        print(f'Creating β-Diffusion model with {args.encoder} encoder...')
+    if args.compile:
+        try:
+            model.forward = torch.compile(model.forward)
+            logger.info("Successfully compiled model.forward")
+        except Exception as e:
+            logger.warning(f"Model compile failed, falling back to no compile: {e}")
     
-    model_confg = args.model
-    model = create_beta_diffusion(**model_confg).to(device)
+    ema_model = deepcopy(model).to(device)
+    ema_model.requires_grad_(False)
+    ema_model.eval()
+    # model.requires_grad_(True)
+    ddp_model = DDP(model, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=True)
+    model = ddp_model.module
+    ddp_model.train()
     
-    # Count parameters
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_params = sum(p.numel() for p in model.parameters())
-    if rank == 0:
-        print(f'Trainable params: {trainable_params / 1e6:.2f}M / Total: {total_params / 1e6:.2f}M')
-        print(model)
-    # Distributed model
-    if distributed:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    model_param_count = sum(p.numel() for p in model.parameters())
+    trainable_param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Model Parameters: {model_param_count/1e6:.2f}M (Trainable: {trainable_param_count/1e6:.2f}M)")
     
-    # Create dataloaders
-    train_loader, train_sampler = create_dataloader(
-        args, is_train=True, distributed=distributed, rank=rank, world_size=world_size
+    #### Optimizer and Scheduler init
+    optimizer, optim_msg = build_optimizer([p for p in model.parameters() if p.requires_grad], training_cfg)
+    
+    ### Data init
+    beta_diffusion_transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+    loader, sampler = prepare_dataloader(
+        args.data_path, micro_batch_size, num_workers, rank, world_size, transform=beta_diffusion_transform
     )
-    val_loader, _ = create_dataloader(
-        args, is_train=False, distributed=distributed, rank=rank, world_size=world_size
-    )
     
-    if rank == 0:
-        print(f'Training samples: {len(train_loader.dataset)}')
-        print(f'Validation samples: {len(val_loader.dataset)}')
+    val_transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, image_size)),
+        transforms.ToTensor(),
+    ])
+    val_path = args.data_path.parent / "val" if (args.data_path.parent / "val").exists() else args.data_path
+    val_dataset = ImageFolder(str(val_path), transform=val_transform)
+    val_loader = DataLoader(val_dataset, batch_size=micro_batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
     
-    # Create optimizer and scheduler
-    optimizer = AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.95),
-    )
+    loader_batches = len(loader)
+    if loader_batches % grad_accum_steps != 0:
+        logger.warning("Number of loader batches not divisible by grad_accum_steps, some samples may be dropped.")
+    steps_per_epoch = loader_batches // grad_accum_steps
+    if steps_per_epoch <= 0:
+        raise ValueError("Gradient accumulation configuration results in zero optimizer steps per epoch.")
     
-    scheduler = get_lr_scheduler(optimizer, args, len(train_loader))
+    scheduler = None
+    sched_msg = "No LR scheduler."
+    if training_cfg.get("scheduler"):
+        scheduler, sched_msg = build_scheduler(optimizer, steps_per_epoch, training_cfg)
     
-    # Resume from checkpoint
+    ### Resuming and checkpointing
     start_epoch = 0
     global_step = 0
-    if args.resume is not None:
-        if rank == 0:
-            print(f'Resuming from {args.resume}')
-        checkpoint = torch.load(args.resume, map_location=device)
-        model_state = checkpoint['model']
-        if distributed:
-            model.module.load_state_dict(model_state)
+    try:
+        maybe_resume_ckpt_path = find_resume_checkpoint(experiment_dir)
+        if maybe_resume_ckpt_path is not None:
+            logger.info(f"Experiment resume checkpoint found at {maybe_resume_ckpt_path}, automatically resuming...")
+            ckpt_path = Path(maybe_resume_ckpt_path)
+            if ckpt_path.is_file():
+                start_epoch, global_step = load_checkpoint(
+                    str(ckpt_path),
+                    ddp_model,
+                    ema_model,
+                    optimizer,
+                    scheduler,
+                )
+                logger.info(f"[Rank {rank}] Resumed from {ckpt_path} (epoch={start_epoch}, step={global_step}).")
+            else:
+                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         else:
-            model.load_state_dict(model_state)
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        start_epoch = checkpoint['epoch'] + 1
-        global_step = checkpoint.get('global_step', 0)
-    
-    # Training loop
-    if rank == 0:
-        print(f'Starting training from epoch {start_epoch}...')
-    
-    best_loss = float('inf')
-    
-    for epoch in range(start_epoch, args.epochs):
-        if distributed and train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        
-        # Train
-        train_metrics, global_step = train_one_epoch(
-            model, train_loader, optimizer, scheduler, epoch, args, rank, global_step
-        )
-        
+            # starting from fresh, save worktree and configs
+            if rank == 0:
+                save_worktree(experiment_dir, full_cfg)
+                logger.info(f"Saved training worktree and config to {experiment_dir}.")
+    except ValueError:
+        # No checkpoint directory found, starting fresh
         if rank == 0:
-            print(f'Epoch {epoch} - Train Loss: {train_metrics["loss"]:.4f} '
-                  f'Recon: {train_metrics["recon_loss"]:.4f} KL: {train_metrics["kl_loss"]:.4f}')
-            
-            if args.wandb:
-                wandb.log({
-                    'epoch/train_loss': train_metrics['loss'],
-                    'epoch/train_recon_loss': train_metrics['recon_loss'],
-                    'epoch/train_kl_loss': train_metrics['kl_loss'],
-                    'epoch': epoch,
-                })
-            
-            # Visualize reconstructions
-            sample_batch = next(iter(val_loader))
-            model_for_vis = model.module if distributed else model
-            beta_values = torch.linspace(args.beta_min, args.beta_max, 4).tolist()
-            visualize_reconstructions(
-                model_for_vis, sample_batch[0], 
-                output_dir / 'visualizations', epoch, beta_values
-            )
-            
-            # Save checkpoint
-            if (epoch + 1) % args.save_interval == 0:
-                model_state = model.module.state_dict() if distributed else model.state_dict()
-                checkpoint = {
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model': model_state,
-                    'optimizer': optimizer.state_dict(),
-                    'scheduler': scheduler.state_dict(),
-                    'args': vars(args),
-                    'train_metrics': train_metrics,
-                }
-                
-                ckpt_path = output_dir / 'checkpoints' / f'epoch_{epoch:04d}.pt'
-                torch.save(checkpoint, ckpt_path)
-                print(f'Saved checkpoint to {ckpt_path}')
-                
-                # Save best model
-                if train_metrics['loss'] < best_loss:
-                    best_loss = train_metrics['loss']
-                    torch.save(checkpoint, output_dir / 'checkpoints' / 'best.pt')
-                    print(f'New best model saved!')
+            save_worktree(experiment_dir, full_cfg)
+            logger.info(f"Saved training worktree and config to {experiment_dir}.")
     
-    # Save final model
+    ### Logging experiment details
     if rank == 0:
-        model_state = model.module.state_dict() if distributed else model.state_dict()
-        torch.save({
-            'epoch': args.epochs - 1,
-            'model': model_state,
-            'args': vars(args),
-        }, output_dir / 'checkpoints' / 'final.pt')
-        print(f'Training complete! Final model saved.')
+        logger.info(f"β-Diffusion Model: β_min={beta_min}, β_max={beta_max}")
+        if clip_grad is not None:
+            logger.info(f"Clipping gradients to max norm {clip_grad}.")
+        else:
+            logger.info("Not clipping gradients.")
+        logger.info(optim_msg)
+        logger.info(sched_msg)
+        logger.info(f"Training for {num_epochs} epochs, batch size {micro_batch_size} per GPU.")
+        logger.info(f"Dataset contains {len(loader.dataset)} samples, {steps_per_epoch} steps per epoch.")
+        logger.info(f"Running with world size {world_size}, starting from epoch {start_epoch} to {num_epochs}.")
     
-    if args.wandb and rank == 0:
-        wandb.finish()
+    log_steps = 0
+    running_loss = 0.0
+    running_recon_loss = 0.0
+    running_kl_loss = 0.0
+    start_time = time()
+    
+    dist.barrier()
+    for epoch in range(start_epoch, num_epochs):
+        ddp_model.train()
+        sampler.set_epoch(epoch)
+        epoch_metrics: Dict[str, torch.Tensor] = defaultdict(lambda: torch.zeros(1, device=device))
+        num_batches = 0
+        optimizer.zero_grad()
+        
+        if checkpoint_interval > 0 and epoch % checkpoint_interval == 0 and rank == 0:
+            logger.info(f"Saving checkpoint at epoch {epoch}...")
+            ckpt_path = f"{checkpoint_dir}/ep-{epoch:07d}.pt"
+            save_checkpoint(
+                ckpt_path,
+                global_step,
+                epoch,
+                ddp_model,
+                ema_model,
+                optimizer,
+                scheduler,
+            )
+        
+        for step, (images, _) in enumerate(loader):
+            images = images.to(device)
+            
+            optimizer.zero_grad(set_to_none=True)
+            with autocast(**autocast_kwargs):
+                outputs = ddp_model(images)
+                loss = outputs['loss']
+            
+            loss.float()
+            if scaler:
+                scaler.scale(loss / grad_accum_steps).backward()
+            else:
+                (loss / grad_accum_steps).backward()
+            
+            if clip_grad:
+                if scaler:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), clip_grad)
+            
+            if global_step % grad_accum_steps == 0:
+                if scaler:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                update_ema(ema_model, ddp_model.module, decay=ema_decay)
+            
+            running_loss += loss.item()
+            running_recon_loss += outputs['recon_loss'].item()
+            running_kl_loss += outputs['kl_loss'].item()
+            epoch_metrics['loss'] += loss.detach()
+            epoch_metrics['recon_loss'] += outputs['recon_loss'].detach()
+            epoch_metrics['kl_loss'] += outputs['kl_loss'].detach()
+            
+            if log_interval > 0 and global_step % log_interval == 0 and rank == 0:
+                avg_loss = running_loss / log_interval
+                avg_recon = running_recon_loss / log_interval
+                avg_kl = running_kl_loss / log_interval
+                avg_beta = outputs['beta'].mean().item()
+                stats = {
+                    "train/loss": avg_loss,
+                    "train/recon_loss": avg_recon,
+                    "train/kl_loss": avg_kl,
+                    "train/beta_mean": avg_beta,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                }
+                logger.info(
+                    f"[Epoch {epoch} | Step {global_step}] "
+                    + ", ".join(f"{k}: {v:.4f}" for k, v in stats.items())
+                )
+                if args.wandb:
+                    wandb_utils.log(stats, step=global_step)
+                running_loss = 0.0
+                running_recon_loss = 0.0
+                running_kl_loss = 0.0
+            
+            if sample_every > 0 and global_step % sample_every == 0 and rank == 0:
+                logger.info("Generating reconstructions...")
+                sample_batch = next(iter(val_loader))
+                beta_values = torch.linspace(beta_min, beta_max, 4).tolist()
+                visualize_reconstructions(
+                    model, sample_batch[0], vis_dir, epoch, beta_values, logger, use_wandb=False
+                )
+                ddp_model.train()
+            
+            global_step += 1
+            num_batches += 1
+        
+        if rank == 0 and num_batches > 0:
+            avg_loss = epoch_metrics['loss'].item() / num_batches
+            avg_recon = epoch_metrics['recon_loss'].item() / num_batches
+            avg_kl = epoch_metrics['kl_loss'].item() / num_batches
+            epoch_stats = {
+                "epoch/loss": avg_loss,
+                "epoch/recon_loss": avg_recon,
+                "epoch/kl_loss": avg_kl,
+            }
+            logger.info(
+                f"[Epoch {epoch}] "
+                + ", ".join(f"{k}: {v:.4f}" for k, v in epoch_stats.items())
+            )
+            if args.wandb:
+                wandb_utils.log(epoch_stats, step=global_step)
+        evaluate_model(ema_model, val_loader, epoch, vis_dir, logger, beta_min, beta_max)
+    # save the final ckpt
+    if rank == 0:
+        logger.info(f"Saving final checkpoint at epoch {num_epochs}...")
+        ckpt_path = f"{checkpoint_dir}/ep-last.pt"
+        save_checkpoint(
+            ckpt_path,
+            global_step,
+            num_epochs,
+            ddp_model,
+            ema_model,
+            optimizer,
+            scheduler,
+        )
+    
+    dist.barrier()
+    logger.info("Done!")
+    cleanup_distributed()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

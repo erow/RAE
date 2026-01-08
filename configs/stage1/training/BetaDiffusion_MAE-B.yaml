@@ -1,0 +1,62 @@
+# β-Diffusion Training Configuration
+# Uses MAE-Base encoder with DiT modulator
+
+data:
+  image_size: 256
+  num_workers: 10
+
+model:
+  # Encoder
+  encoder: mae-base
+  encoder_freeze: True
+  latent_dim: 64
+  encoder_input_size: 256
+  
+  # Modulator (DiT)
+  modulator_depth: 2
+  modulator_heads: 12
+  modulator_mlp_ratio: 4.0
+  
+  # Decoder
+  decoder_layers: 4
+  decoder_hidden_dim: 1024
+  decoder_patch_size: 16
+  decoder_block_type: mlp  # 'mlp' or 'attention'
+  decoder_num_heads: 8     # only used when decoder_block_type is 'attention'
+  decoder_mlp_ratio: 4.0
+  
+  # β-Diffusion specific
+  beta_min: 0.1
+  beta_max: 10.0
+
+training:
+  # Optimization
+  epochs: 100
+  batch_size: 64
+  grad_accum_steps: 1
+  global_seed: 0
+  
+  # Optimizer (used by build_optimizer)
+  optimizer:
+    type: adamw
+    lr: 2.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.01
+  
+  # Scheduler (used by build_scheduler)
+  scheduler:
+    type: cosine
+    warmup_epochs: 5
+    final_lr: 1.0e-6
+  
+  # EMA
+  ema_decay: 0.9999
+  
+  # Gradient clipping
+  clip_grad: 1.0
+  
+  
+  # Logging
+  log_interval: 100
+  sample_every: 500
+  checkpoint_interval: 5

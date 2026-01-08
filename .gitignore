@@ -1,6 +1,7 @@
 __pycache__
 wandb
-output
+output/
+outputs/
 
 .DS_store
 /samples/
