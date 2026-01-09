@@ -33,6 +33,8 @@ Here, $D_\psi$ is the MLP decoder, which also receives $\beta$ as an auxiliary i
 python -m debugpy --listen 0.0.0.0:5679 -m torch.distributed.launch src/train_beta_diffusion.py \
   --config configs/stage1/training/BetaDiffusion_DINOv2-B.yaml \
   --data-path $IMNET 
+
+ENTITY=erow PROJECT='beta-diffusion' EXPERIMENT_NAME=mae-trail_v0.1 sbatch  ~/storchrun.sh src/train_beta_diffusion.py  --data-path $IMNET  --config configs/stage1/training/BetaDiffusion_MAE-B.yaml --wandb
 ```
 
 

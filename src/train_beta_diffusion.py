@@ -255,7 +255,14 @@ def main():
     logger.info(f"Model Parameters: {model_param_count/1e6:.2f}M (Trainable: {trainable_param_count/1e6:.2f}M)")
     
     #### Optimizer and Scheduler init
-    optimizer, optim_msg = build_optimizer([p for p in model.parameters() if p.requires_grad], training_cfg)
+    # build parameter groups for encoder and decoder separately
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad and p.requires_grad]
+    decoder_params = [p for name, p in model.named_parameters() if 'encoder' not in name and p.requires_grad]
+    param_groups = [
+        {"params": encoder_params, "lr_scale": training_cfg['encoder_lr_scale']},
+        {"params": decoder_params, "lr_scale": 1.0, "weight_decay": 0},
+    ]
+    optimizer, optim_msg = build_optimizer(param_groups, training_cfg)
     
     ### Data init
     beta_diffusion_transform = transforms.Compose([
